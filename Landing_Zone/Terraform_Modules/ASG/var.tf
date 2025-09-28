@@ -7,3 +7,6 @@ variable "location" {
 variable "tags" {
   type = map(string)
 }
+variable "asg_name" {
+  type = string
+}
