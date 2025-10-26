@@ -1,0 +1,9 @@
+output "kv_name" {
+  value = azurerm_key_vault.kv.name
+}
+output "kv_id" {
+  value = azurerm_key_vault.kv.id
+}
+output "kv_vault_url" {
+  value = azurerm_key_vault.kv.vault_uri
+}
