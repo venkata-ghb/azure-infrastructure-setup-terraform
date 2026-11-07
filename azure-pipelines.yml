@@ -1,0 +1,195 @@
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    include:
+      - infra/*
+
+pr: none
+
+
+stages:
+  - stage: build
+    jobs:
+      - job: build
+        displayName: Build artifact
+        pool:
+          vmImage: 'windows-latest'
+        steps:
+          - template: ./terraform-templates/terraform-ci.yml
+  
+  - stage: dev
+    dependsOn: Build
+    condition: Succeeded()
+    displayName: dev
+    jobs:
+      - deployment: ValidateAndPlan
+        environment: dev
+        displayName: "Validate and Plan"
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              
+              - template: ./terraform-templates/terraform-plan.yml
+                parameters:
+                  env: 'dev'
+                  location: 'westeurope'
+                  serviceConnection: 'LoyaltyPlatformInt DEV'
+                  subscription: 'd3454fee-d01c-4780-919b-b33be5ea9173'
+                  resourceGroup: 'Kesko_WE_RG_LoyaltyPlatformInt_dev_001'
+                  storageAccount: 'lpidevterraformstate'
+                  containerName: 'tfstate'
+                  stateFile: 'dev.terraform.tfstate'
+
+      - job: "waitForValidation"
+        dependsOn: ValidateAndPlan
+        condition: Succeeded()
+        displayName: "Manual approval"
+        pool: "server"
+        timeoutInMinutes: "1440" # job times out in 3 days
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              instructions: "Please review the output of Terraform plan before approving."
+              onTimeout: "reject"
+          
+      - deployment: Deploy
+        dependsOn: "waitForValidation"
+        environment: dev
+        displayName: "Deploy"
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: ./terraform-templates/terraform-apply.yml
+                parameters:
+                  env: 'dev'
+                  location: 'westeurope'
+                  serviceConnection: 'LoyaltyPlatformInt DEV'
+                  subscription: 'd3454fee-d01c-4780-919b-b33be5ea9173'
+                  resourceGroup: 'Kesko_WE_RG_LoyaltyPlatformInt_dev_001'
+                  storageAccount: 'lpidevterraformstate'
+                  containerName: 'tfstate'
+                  stateFile: 'dev.terraform.tfstate'
+  - stage: qa
+    condition: Succeeded()
+    displayName: qa
+    jobs:
+      - deployment: ValidateAndPlan
+        environment: qa
+        displayName: "Validate and Plan"
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: ./terraform-templates/terraform-plan.yml
+                parameters:
+                  env: 'qa'
+                  location: 'westeurope'
+                  serviceConnection: 'LoyaltyPlatformInt QA'
+                  subscription: '9879ef1a-4731-4f4d-9343-611a0147a234'
+                  resourceGroup: 'Kesko_WE_RG_LoyaltyPlatformInt_qa_001'
+                  storageAccount: 'lpiqaterraformstate'
+                  containerName: 'tfstate'
+                  stateFile: 'qa.terraform.tfstate'
+
+      - job: "waitForValidation"
+        dependsOn: ValidateAndPlan
+        condition: Succeeded()
+        displayName: "Manual approval"
+        pool: "server"
+        timeoutInMinutes: "1440" # job times out in 3 days
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              instructions: 'Please review the output of Terraform plan before approving.'
+              onTimeout: 'reject'
+          
+      - deployment: Deploy
+        dependsOn: "waitForValidation"
+        environment: qa
+        displayName: "Deploy"
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: ./terraform-templates/terraform-apply.yml
+                parameters:
+                  env: 'qa'
+                  location: 'westeurope'
+                  serviceConnection: 'LoyaltyPlatformInt QA'
+                  subscription: '9879ef1a-4731-4f4d-9343-611a0147a234'
+                  resourceGroup: 'Kesko_WE_RG_LoyaltyPlatformInt_qa_001'
+                  storageAccount: 'lpiqaterraformstate'
+                  containerName: 'tfstate'
+                  stateFile: 'qa.terraform.tfstate'
+  - stage: prod
+    condition: Succeeded()
+    displayName: prod
+    jobs:
+      - deployment: ValidateAndPlan
+        environment: prod
+        displayName: "Validate and Plan"
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: ./terraform-templates/terraform-plan.yml
+                parameters:
+                  env: 'prod'
+                  location: 'westeurope'
+                  serviceConnection: 'LoyaltyPlatformInt PROD'
+                  subscription: '8b11f2fb-7e4d-485c-bed2-8942baaeb599'
+                  resourceGroup: 'Kesko_WE_RG_LoyaltyPlatformInt_prod_001'
+                  storageAccount: 'lpiprodterraformstate'
+                  containerName: 'tfstate'
+                  stateFile: 'prod.terraform.tfstate'
+
+      - job: "waitForValidation"
+        dependsOn: ValidateAndPlan
+        condition: Succeeded()
+        displayName: "Manual approval"
+        pool: "server"
+        timeoutInMinutes: "1440" # job times out in 3 days
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440 # task times out in 1 day
+            inputs:
+              instructions: 'Please review the output of Terraform plan before approving.'
+              onTimeout: 'reject'
+          
+      - deployment: Deploy
+        dependsOn: "waitForValidation"
+        environment: prod
+        displayName: "Deploy"
+        pool:
+          vmImage: 'windows-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - template: ./terraform-templates/terraform-apply.yml
+                parameters:
+                  env: 'prod'
+                  location: 'westeurope'
+                  serviceConnection: 'LoyaltyPlatformInt PROD'
+                  subscription: '8b11f2fb-7e4d-485c-bed2-8942baaeb599'
+                  resourceGroup: 'Kesko_WE_RG_LoyaltyPlatformInt_prod_001'
+                  storageAccount: 'lpiprodterraformstate'
+                  containerName: 'tfstate'
+                  stateFile: 'prod.terraform.tfstate'
+                  
