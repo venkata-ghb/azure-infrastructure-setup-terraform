@@ -1,0 +1,207 @@
+pool:
+  name: Cirrus-CoreAIHub-AgentPool
+
+trigger: none
+
+variables: 
+  - group: ABB-CoreAI-VariableGroup 
+  - name: service_connection
+    value: SC_ABB-APP-NMG-PROD-APM0013771-01 
+
+  - ${{ if eq(parameters.environment, 'DEV') }}:
+    - name: resource_tf_root
+      value: 'Subscriptions/ABB-APP-NMG-PROD-APM0013771-01/DEV'
+    - name: tfstate_file
+      value: 'ABB-APP-NMG-PROD-APM0013771-01_DEV_resources.tfstate' 
+    - name: provision_managed_network_aihub_enable
+      value: true
+    - name: rg_name
+      value: "COREAIHUB-SC-MODELS-DEV-RG"
+    - name: ai_hub_name
+      value: "coreaihub-sc-aiserviceshub-dev"
+    - name: pvt_link_rg_name
+      value: ''
+    - name: remote_resource_name
+      value: ''
+    - name: connection_name
+      value: ''
+
+  - ${{ if eq(parameters.environment, 'PROD') }}:
+    - name: resource_tf_root
+      value: 'Subscriptions/ABB-APP-NMG-PROD-APM0013771-01/PROD'
+    - name: tfstate_file
+      value: 'ABB-APP-NMG-PROD-APM0013771-01_PROD_resources.tfstate'
+    - name: provision_managed_network_aihub_enable
+      value: true
+    - name: rg_name
+      value: "COREAIHUB-SC-MODELS-PROD-RG"
+    - name: ai_hub_name
+      value: "coreaihub-sc-aiserviceshub-prod"
+    - name: pvt_link_rg_name
+      value: ''
+    - name: remote_resource_name
+      value: ''
+    - name: connection_name
+      value: ''
+
+parameters:
+- name: enable_apply
+  displayName: Enable_Apply
+  type: boolean
+
+- name: environment
+  displayName: Select_Environment
+  type: string
+  default: DEV
+  values:
+    - DEV
+    - PROD
+
+stages:
+  - stage: Resource_Creation_Plan_Stage
+    displayName: 'Resource_Creation_Plan_Stage'
+    jobs:
+    - job: Resource_Creation_Plan_job
+      workspace:
+        clean: all
+      displayName: Resource_Creation_Plan_job
+      steps:
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: 'latest'
+
+        - task: TerraformTaskV4@4
+          displayName: Terraform Init
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '-backend-config="access_key=$(cirrus_sta_access_key)"'
+            backendServiceArm: '$(service_connection)'
+            backendAzureRmResourceGroupName: 'CoreAIHub-Terraform-RG'
+            backendAzureRmStorageAccountName: 'coreaihubcrsterraformsa'
+            backendAzureRmContainerName: 'coreai-cirrus-tf-statefiles'
+            backendAzureRmKey: '$(tfstate_file)'
+        
+        - task: AzureCLI@2
+          displayName: 'Break lease on tfstate blob'
+          env:
+            AZURE_STORAGE_KEY: $(cirrus_sta_access_key)
+          inputs:
+            azureSubscription: '$(service_connection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              echo "Checking lease status of the blob..."
+
+              lease_status=$(az storage blob show \
+                --container-name coreai-cirrus-tf-statefiles \
+                --name $(tfstate_file) \
+                --account-name coreaihubcrsterraformsa \
+                --query "properties.lease.status" \
+                --output tsv)
+
+              echo "Lease status:$lease_status"
+
+              if [ "$lease_status" = "locked" ]; then
+                echo "Blob is locked. Breaking lease..."
+                az storage blob lease break \
+                  --container-name coreai-cirrus-tf-statefiles \
+                  --blob-name $(tfstate_file) \
+                  --account-name coreaihubcrsterraformsa
+              else
+                echo "Blob is not locked. Skipping lease break."
+              fi
+        
+        - task: AzureCLI@2
+          displayName: "Approve private endpoint connection"
+          condition: ne(variables['pvt_link_rg_name'], '')
+          inputs:
+            azureSubscription: '$(service_connection)'
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              pvt_link_rg_name=$(pvt_link_rg_name)
+              remote_resource_name=$(remote_resource_name)
+              connection_name=$(connection_name)
+        
+              # Approve the specific connection
+              az network private-endpoint-connection approve \
+                -g "$pvt_link_rg_name" \
+                -n "$connection_name" \
+                --type "Microsoft.CognitiveServices/accounts" \
+                --resource-name "$remote_resource_name" \
+                --description "Approved automatically via pipeline"
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform : plan'
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '-var-file="parameters.tfvars" -var="private_dns_zone_subscription_id=$(private_dns_zone_subscription_id)" -generate-config-out=generated.tf -out=resource-creation-tfplan'
+            environmentServiceNameAzureRM: '$(service_connection)'
+            publishPlanResults: 'resource-creation-tfplan'
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish pipeline artifacts'
+          inputs:
+            targetPath: '$(resource_tf_root)/resource-creation-tfplan'
+            artifactName: '$(Build.BuildID)-resource-creation-tfplan'
+            publishLocation: 'pipeline'
+            
+  - stage: Resource_Creation_Apply_Stage
+    displayName: 'Resource_Creation_Apply_Stage'
+    variables:
+      enable_apply_var: ${{ parameters.enable_apply }}
+    dependsOn: Resource_Creation_Plan_Stage
+    condition: and(succeeded('Resource_Creation_Plan_Stage'), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'),eq(variables['Build.SourceBranch'], 'refs/heads/develop')), eq(variables['enable_apply_var'], 'true'))
+    jobs:      
+    - job: Resource_Creation_Apply_job
+      displayName: Terraform Apply
+      steps:
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download pipeline artifacts'
+          inputs:
+            buildType: 'current'
+            artifactName: '$(Build.BuildID)-resource-creation-tfplan'
+            targetPath: '$(Pipeline.Workspace)/$(Build.BuildID)-resource-creation-tfplan'
+
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: 'latest'
+
+        - task: TerraformTaskV4@4
+          displayName: Terraform Init
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '-backend-config="access_key=$(cirrus_sta_access_key)"'
+            backendServiceArm: '$(service_connection)'
+            backendAzureRmResourceGroupName: 'CoreAIHub-Terraform-RG'
+            backendAzureRmStorageAccountName: 'coreaihubcrsterraformsa'
+            backendAzureRmContainerName: 'coreai-cirrus-tf-statefiles'
+            backendAzureRmKey: '$(tfstate_file)'
+        
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform : apply'
+          inputs:
+            command: apply
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '$(Pipeline.Workspace)/$(Build.BuildID)-resource-creation-tfplan/resource-creation-tfplan'
+            environmentServiceNameAzureRM: '$(service_connection)'
+        
+        - task: AzureCLI@2
+          displayName: 'AI Foundry Hub CLI Task'
+          condition: eq(variables['provision_managed_network_aihub_enable'], 'true')
+          inputs:
+            azureSubscription: '$(service_connection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              resource_group='$(rg_name)'
+              ai_hub_name='$(ai_hub_name)'
+              az extension add -n ml
+              echo "Provision the AI Foundry Hub managed network $ai_hub_name"
+              az ml workspace provision-network -g $resource_group -n $ai_hub_name

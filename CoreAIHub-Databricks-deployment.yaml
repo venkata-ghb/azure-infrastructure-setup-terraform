@@ -1,0 +1,155 @@
+pool:
+  name: CoreAIHub-AgentPool
+
+trigger: none
+
+variables: 
+  - group: Moon_Dev_Terraform 
+  - name: service_connection
+    value: APM0013771-CoreAIHub-Databricks-Dev-SP
+
+  - ${{ if eq(parameters.environment, 'DEV') }}:
+    - name: resource_tf_root
+      value: 'Subscriptions/ABB-WE-ACE-PRD-APM0013771-CoreAIHub/Databricks/DEV'
+    - name: tfstate_file
+      value: 'ABB-WE-ACE-PRD-APM0013771-CoreAIHub_DEV_Databricks.tfstate'
+    - name: plan
+      value: '-var-file="parameters.tfvars" -var="private_dns_zone_subscription_id=$(private_dns_zone_subscription_id)" -var="databricks_account_id=$(databricks_account_id)" -var="ace_dev_subscription_id=$(ace_dev_subscription_id)" -var="user_name=$(sql_user_name)" -var="password=$(sql_password)" -var="host=$(host)" -var="port=$(port)" -var="database_name=$(db)" -generate-config-out=generated.tf -out=resource-creation-tfplan'
+
+  - ${{ if eq(parameters.environment, 'PROD') }}:
+    - name: resource_tf_root
+      value: 'Subscriptions/ABB-WE-ACE-PRD-APM0013771-CoreAIHub/Databricks/PROD'
+    - name: tfstate_file
+      value: 'ABB-WE-ACE-PRD-APM0013771-CoreAIHub_PROD_Databricks.tfstate'
+    - name: plan
+      value: '-var-file="parameters.tfvars" -var="private_dns_zone_subscription_id=$(private_dns_zone_subscription_id)" -var="databricks_account_id=$(databricks_account_id)" -var="ace_dev_subscription_id=$(ace_dev_subscription_id)" -var="user_name=$(sql_user_name)" -var="password=$(sql_password)" -var="host=$(host)" -var="port=$(port)" -var="database_name=$(db)" -generate-config-out=generated.tf -out=resource-creation-tfplan'
+
+
+parameters:
+- name: enable_apply
+  displayName: Enable_Apply
+  type: boolean
+
+- name: environment
+  displayName: Select_Environment
+  type: string
+  default: DEV
+  values:
+    - DEV
+    - PROD
+
+stages:
+  - stage: Resource_Creation_Plan_Stage
+    displayName: 'Resource_Creation_Plan_Stage'
+    jobs:
+    - job: Resource_Creation_Plan_job
+      workspace:
+        clean: all
+      displayName: Resource_Creation_Plan_job
+      steps:
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: 'latest'
+
+        - task: TerraformTaskV4@4
+          displayName: Terraform Init
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '-backend-config="access_key=$(sta_access_key)"'
+            backendServiceArm: '$(service_connection)'
+            backendAzureRmResourceGroupName: 'CoreAIHub-Terraform-RG'
+            backendAzureRmStorageAccountName: 'coreaihubterraformsa'
+            backendAzureRmContainerName: 'coreai-tf-statefiles'
+            backendAzureRmKey: '$(tfstate_file)'
+
+ 
+        - task: AzureCLI@2
+          displayName: 'Break lease on tfstate blob'
+          env:
+            AZURE_STORAGE_KEY: $(sta_access_key)
+          inputs:
+            azureSubscription: '$(service_connection)'
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            inlineScript: |
+              echo "Checking lease status of the blob..."
+
+              lease_status=$(az storage blob show \
+                --container-name coreai-tf-statefiles \
+                --name '$(tfstate_file)' \
+                --account-name coreaihubterraformsa \
+                --query "properties.lease.status" \
+                --output tsv)
+
+              echo "Lease status:$lease_status"
+
+              if [ "$lease_status" = "locked" ]; then
+                echo "Blob is locked. Breaking lease..."
+                az storage blob lease break \
+                  --container-name coreai-tf-statefiles \
+                  --blob-name '$(tfstate_file)' \
+                  --account-name coreaihubterraformsa
+              else
+                echo "Blob is not locked. Skipping lease break."
+              fi
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform : plan'
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '$(plan)'
+            environmentServiceNameAzureRM: '$(service_connection)'
+            publishPlanResults: 'resource-creation-tfplan'
+
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish pipeline artifacts'
+          inputs:
+            targetPath: '$(resource_tf_root)/resource-creation-tfplan'
+            artifactName: '$(Build.BuildID)-resource-creation-tfplan'
+            publishLocation: 'pipeline'
+
+  - stage: Resource_Creation_Apply_Stage
+    displayName: 'Resource_Creation_Apply_Stage'
+    variables:
+      enable_apply_var: ${{ parameters.enable_apply }}
+    dependsOn: Resource_Creation_Plan_Stage
+    condition: and(succeeded('Resource_Creation_Plan_Stage'), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'),eq(variables['Build.SourceBranch'], 'refs/heads/develop')), eq(variables['enable_apply_var'], 'true'))
+    jobs:
+    - job: Resource_Creation_Apply_job
+      displayName: Terraform Apply
+      steps:
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download pipeline artifacts'
+          inputs:
+            buildType: 'current'
+            artifactName: '$(Build.BuildID)-resource-creation-tfplan'
+            targetPath: '$(Pipeline.Workspace)/$(Build.BuildID)-resource-creation-tfplan'
+
+        - task: TerraformInstaller@1
+          inputs:
+            terraformVersion: 'latest'
+
+        - task: TerraformTaskV4@4
+          displayName: Terraform Init
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '-backend-config="access_key=$(sta_access_key)"'
+            backendServiceArm: '$(service_connection)'
+            backendAzureRmResourceGroupName: 'CoreAIHub-Terraform-RG'
+            backendAzureRmStorageAccountName: 'coreaihubterraformsa'
+            backendAzureRmContainerName: 'coreai-tf-statefiles'
+            backendAzureRmKey: '$(tfstate_file)'
+
+        - task: TerraformTaskV4@4
+          displayName: 'Terraform : apply'
+          inputs:
+            command: apply
+            workingDirectory: '$(resource_tf_root)'
+            commandOptions: '$(Pipeline.Workspace)/$(Build.BuildID)-resource-creation-tfplan/resource-creation-tfplan'
+            environmentServiceNameAzureRM: '$(service_connection)'
